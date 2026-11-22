@@ -2,6 +2,7 @@
 import { useMemo, useState, useRef, useEffect } from "react";
 import * as XLSX from "xlsx";
 import "./App.css";
+import { supabase } from "./lib/supabase.js";
 
 
 const initialEmployees = [
@@ -48,6 +49,126 @@ const calculate = (employee) => {
 
 function App() {
   const [activePage, setActivePage] = useState("Dashboard");
+  const [session, setSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [staffProfile, setStaffProfile] = useState(null);
+  const [employeeLoading, setEmployeeLoading] = useState(false);
+  const [employeeDbMessage, setEmployeeDbMessage] = useState("");
+
+  useEffect(() => {
+    let mounted = true;
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!mounted) return;
+      if (error) setAuthError(error.message);
+      setSession(data?.session || null);
+      setAuthLoading(false);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (mounted) setSession(nextSession || null);
+    });
+    return () => { mounted = false; subscription.unsubscribe(); };
+  }, []);
+
+  const handleLogin = async (event) => {
+    event.preventDefault();
+    setAuthBusy(true);
+    setAuthError("");
+    const { error } = await supabase.auth.signInWithPassword({
+      email: loginEmail.trim(),
+      password: loginPassword,
+    });
+    if (error) setAuthError(error.message);
+    setAuthBusy(false);
+  };
+
+  const handleLogout = async () => {
+    const { error } = await supabase.auth.signOut();
+    if (error) setAuthError(`Gagal keluar: ${error.message}`);
+    else {
+      setSession(null);
+      setStaffProfile(null);
+      setEmployees([]);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadSignedInWorkspace = async () => {
+      if (!session?.user) {
+        setStaffProfile(null);
+        setEmployees([]);
+        return;
+      }
+      setEmployeeLoading(true);
+      setAuthError("");
+      const { data: profile, error: profileError } = await supabase
+        .from("profiles")
+        .select("id, full_name, role, employee_id")
+        .eq("id", session.user.id)
+        .maybeSingle();
+      if (cancelled) return;
+      if (profileError || !profile || !["owner", "admin", "hr"].includes(profile.role)) {
+        await supabase.auth.signOut();
+        setAuthError(profileError?.message || "Akun belum diberi hak akses payroll. Hubungi owner untuk mengaktifkan profil admin.");
+        setSession(null);
+        setEmployeeLoading(false);
+        return;
+      }
+      setStaffProfile(profile);
+      let { data: rows, error: employeeError } = await supabase
+        .from("employees")
+        .select("id, employee_code, full_name, position, base_salary, phone, is_active")
+        .order("full_name", { ascending: true });
+      if (employeeError) {
+        if (!cancelled) setAuthError(`Gagal memuat data karyawan: ${employeeError.message}`);
+        setEmployeeLoading(false);
+        return;
+      }
+      // Migrasi awal: masukkan daftar bawaan satu kali jika tabel Supabase masih kosong.
+      if ((rows || []).length === 0) {
+        const seedRows = initialEmployees.map((employee, index) => ({
+          employee_code: `SD-${String(index + 1).padStart(3, "0")}`,
+          full_name: employee.name,
+          position: employee.position,
+          base_salary: Number(employee.salary || 0),
+          phone: employee.phone || null,
+          is_active: true,
+        }));
+        const { data: inserted, error: seedError } = await supabase
+          .from("employees")
+          .insert(seedRows)
+          .select("id, employee_code, full_name, position, base_salary, phone, is_active");
+        if (seedError) {
+          if (!cancelled) setAuthError(`Gagal menyiapkan data karyawan awal: ${seedError.message}`);
+          setEmployeeLoading(false);
+          return;
+        }
+        rows = inserted || [];
+      }
+      if (!cancelled) {
+        setEmployees((rows || []).map((row) => ({
+          id: row.id,
+          employeeCode: row.employee_code || "",
+          name: row.full_name,
+          position: row.position || "-",
+          salary: Number(row.base_salary || 0),
+          phone: row.phone || "",
+          status: row.is_active ? "aktif" : "nonaktif",
+          overtime: 0,
+          sales: 0,
+          cash: "",
+        })));
+        setEmployeeDbMessage("Data karyawan tersinkron dengan Supabase.");
+      }
+      setEmployeeLoading(false);
+    };
+    loadSignedInWorkspace();
+    return () => { cancelled = true; };
+  }, [session?.user?.id]);
   const [appSettings, setAppSettings] = useState(() => {
     const defaults = {
       businessName: "RESTO & CAFE SISI DANAU",
@@ -323,12 +444,7 @@ const [bonFilter, setBonFilter] = useState("Semua");
 const [bonSearch, setBonSearch] = useState("");
 const [bonMessage, setBonMessage] = useState("");
 
-  const [employees, setEmployees] = useState(() =>
-  initialEmployees.map((employee) => ({
-    ...employee,
-    overtime: 0,
-  }))
-);
+  const [employees, setEmployees] = useState([]);
 
 const handleImportExcel = async (event) => {
   const file = event.target.files?.[0];
@@ -411,93 +527,103 @@ const [newEmployee, setNewEmployee] = useState({
 });
 
 
-const handleAddEmployee = (event) => {
+const handleAddEmployee = async (event) => {
   event.preventDefault();
-
   const name = newEmployee.name.trim().toUpperCase();
   const position = newEmployee.position.trim().toUpperCase();
   const salary = Number(newEmployee.salary);
-
-  if (!name || !position || !salary || salary <= 0) {
+  if (!name || !position || !Number.isFinite(salary) || salary <= 0) {
     setFormError("Lengkapi semua data dengan benar.");
     return;
   }
-
-  if (
-    employees.some(
-      (employee) => employee.name.toLowerCase() === name.toLowerCase()
-    )
-  ) {
+  if (employees.some((employee) => employee.name.toLowerCase() === name.toLowerCase())) {
     setFormError("Nama karyawan sudah terdaftar.");
     return;
   }
-
-  setEmployees((current) => [
-    ...current,
-    {
-      name,
-      position,
-      salary,
-      phone: newEmployee.phone.trim(),
-      overtime: 0,
-      bonus: 0,
-      bonusRamadhan: 0,
-      sales: 0,
-      cash: "",
-    },
-  ]);
-
-  setNewEmployee({ name: "", position: "", salary: "", phone: "" });
   setFormError("");
+  const { data, error } = await supabase.from("employees").insert({
+    full_name: name,
+    position,
+    base_salary: salary,
+    phone: newEmployee.phone.trim() || null,
+    is_active: true,
+  }).select("id, employee_code, full_name, position, base_salary, phone, is_active").single();
+  if (error) {
+    setFormError(`Gagal menyimpan ke database: ${error.message}`);
+    return;
+  }
+  setEmployees((current) => [...current, {
+    id: data.id, employeeCode: data.employee_code || "", name: data.full_name,
+    position: data.position || "-", salary: Number(data.base_salary || 0),
+    phone: data.phone || "", status: data.is_active ? "aktif" : "nonaktif",
+    overtime: 0, bonus: 0, bonusRamadhan: 0, sales: 0, cash: "",
+  }]);
+  setNewEmployee({ name: "", position: "", salary: "", phone: "" });
   setShowAddEmployee(false);
 };
 
-const handleEditEmployee = (event) => {
+const handleEditEmployee = async (event) => {
   event.preventDefault();
-
-  if (!editingEmployee) return;
-
+  if (!editingEmployee?.id) {
+    alert("ID karyawan tidak ditemukan. Muat ulang data sebelum mengedit.");
+    return;
+  }
   const name = editingEmployee.name.trim().toUpperCase();
   const position = editingEmployee.position.trim().toUpperCase();
   const salary = Number(editingEmployee.salary);
-
-  if (!name || !position || !salary || salary <= 0) {
+  if (!name || !position || !Number.isFinite(salary) || salary <= 0) {
     alert("Lengkapi semua data dengan benar.");
     return;
   }
-
-  const duplicate = employees.some(
-    (employee) =>
-      employee.name.toLowerCase() === name.toLowerCase() &&
-      employee.name !== editingEmployee.originalName
+  const duplicate = employees.some((employee) =>
+    employee.id !== editingEmployee.id && employee.name.toLowerCase() === name.toLowerCase()
   );
-
   if (duplicate) {
     alert("Nama karyawan sudah terdaftar.");
     return;
   }
-
-  setEmployees((current) =>
-    current.map((employee) =>
-      employee.name === editingEmployee.originalName
-        ? { ...employee, name, position, salary, phone: String(editingEmployee.phone || "").trim() }
-        : employee
-    )
-  );
-
+  const { data, error } = await supabase.from("employees").update({
+    full_name: name,
+    position,
+    base_salary: salary,
+    phone: String(editingEmployee.phone || "").trim() || null,
+    updated_at: new Date().toISOString(),
+  }).eq("id", editingEmployee.id)
+    .select("id, employee_code, full_name, position, base_salary, phone, is_active")
+    .maybeSingle();
+  if (error) {
+    alert(`Perubahan gagal disimpan ke Supabase: ${error.message}`);
+    return;
+  }
+  if (!data) {
+    alert("Data tidak berubah. Periksa hak akses akun (owner/admin/HR) dan kebijakan RLS.");
+    return;
+  }
+  setEmployees((current) => current.map((employee) => employee.id === data.id ? {
+    ...employee,
+    employeeCode: data.employee_code || employee.employeeCode || "",
+    name: data.full_name,
+    position: data.position || "-",
+    salary: Number(data.base_salary || 0),
+    phone: data.phone || "",
+    status: data.is_active ? "aktif" : "nonaktif",
+  } : employee));
   setEditingEmployee(null);
 };
 
-const handleDeleteEmployee = (employee) => {
-  const confirmed = window.confirm(
-    `Yakin ingin menghapus karyawan ${employee.name}?`
-  );
-
+const handleDeleteEmployee = async (employee) => {
+  const confirmed = window.confirm(`Yakin ingin menghapus karyawan ${employee.name}?`);
   if (!confirmed) return;
-
-  setEmployees((current) =>
-    current.filter((item) => item.name !== employee.name)
-  );
+  if (!employee.id) {
+    alert("ID karyawan tidak ditemukan. Data belum tersinkron dengan database.");
+    return;
+  }
+  const { error } = await supabase.from("employees").delete().eq("id", employee.id);
+  if (error) {
+    alert(`Karyawan gagal dihapus: ${error.message}`);
+    return;
+  }
+  setEmployees((current) => current.filter((item) => item.id !== employee.id));
 };
 
 
@@ -1299,6 +1425,32 @@ const handlePrintSalaryReport = () => {
 };
 
 
+  if (authLoading) {
+    return <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#f3f7fc", color: "#1b2d45", fontFamily: "Inter, Arial, sans-serif" }}>Memeriksa sesi login...</div>;
+  }
+
+  if (!session) {
+    return (
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 24, background: "linear-gradient(135deg,#eaf2fb,#f7faff)", fontFamily: "Inter, Arial, sans-serif" }}>
+        <div style={{ width: "100%", maxWidth: 430, background: "#fff", border: "1px solid #dce6f2", borderRadius: 22, padding: 32, boxShadow: "0 24px 70px rgba(24,57,94,.14)" }}>
+          <div style={{ width: 52, height: 52, display: "grid", placeItems: "center", borderRadius: 15, background: "#1769bd", color: "white", fontWeight: 800, letterSpacing: 1, marginBottom: 22 }}>SD</div>
+          <div style={{ color: "#2675c8", fontSize: 11, fontWeight: 800, letterSpacing: 2 }}>SISI DANAU · PAYROLL</div>
+          <h1 style={{ color: "#172b45", fontSize: 27, margin: "8px 0" }}>Login Administrator</h1>
+          <p style={{ color: "#718096", margin: "0 0 24px", lineHeight: 1.5 }}>Masuk menggunakan akun yang sudah didaftarkan oleh owner. Pendaftaran publik dinonaktifkan.</p>
+          <form onSubmit={handleLogin} style={{ display: "grid", gap: 13 }}>
+            <label style={{ color: "#43566e", fontSize: 13, fontWeight: 700 }}>Email</label>
+            <input type="email" autoComplete="username" required value={loginEmail} onChange={(e) => setLoginEmail(e.target.value)} placeholder="admin@contoh.com" style={{ width: "100%", boxSizing: "border-box", padding: "14px 15px", border: "1px solid #d5e0ed", borderRadius: 11, fontSize: 15, color: "#20334c", background: "#fff" }} />
+            <label style={{ color: "#43566e", fontSize: 13, fontWeight: 700 }}>Password</label>
+            <input type="password" autoComplete="current-password" required value={loginPassword} onChange={(e) => setLoginPassword(e.target.value)} placeholder="Masukkan password" style={{ width: "100%", boxSizing: "border-box", padding: "14px 15px", border: "1px solid #d5e0ed", borderRadius: 11, fontSize: 15, color: "#20334c", background: "#fff" }} />
+            {authError && <div role="alert" style={{ padding: 12, borderRadius: 10, background: "#fff1f0", color: "#b42318", fontSize: 13 }}>{authError}</div>}
+            <button type="submit" disabled={authBusy} style={{ marginTop: 8, padding: 15, border: 0, borderRadius: 11, background: authBusy ? "#8ab5df" : "#1769bd", color: "white", fontWeight: 800, fontSize: 15, cursor: authBusy ? "wait" : "pointer" }}>{authBusy ? "Memproses..." : "Masuk ke Dashboard"}</button>
+          </form>
+          <div style={{ marginTop: 20, color: "#8795a7", fontSize: 11, lineHeight: 1.5 }}>Akses dilindungi Supabase Authentication dan Row Level Security.</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -1329,12 +1481,12 @@ const handlePrintSalaryReport = () => {
         ))}
 
         <div className="sidebar-bottom">
-          <div className="user-avatar">AD</div>
+          <div className="user-avatar">{(staffProfile?.full_name || session.user.email || "AD").slice(0, 2).toUpperCase()}</div>
           <div>
-            <strong>Administrator</strong>
-            <span>Owner Account</span>
+            <strong>{staffProfile?.full_name || session.user.email}</strong>
+            <span>{String(staffProfile?.role || "user").toUpperCase()}</span>
           </div>
-          <span className="online-dot" />
+          <button type="button" onClick={handleLogout} title="Keluar" aria-label="Keluar" style={{ marginLeft: "auto", border: 0, background: "transparent", color: "inherit", cursor: "pointer", fontSize: 12 }}>Keluar</button>
         </div>
       </aside>
 
@@ -1431,7 +1583,7 @@ const handlePrintSalaryReport = () => {
                       </thead>
                       <tbody>
                         {payrollData.slice(0, 6).map((employee) => (
-                          <tr key={employee.name}>
+                          <tr key={employee.id || employee.name}>
                             <td><strong>{employee.name}</strong></td>
                             <td><span className="position-tag">{employee.position}</span></td>
                             <td>{money(employee.salary)}</td>
@@ -1503,10 +1655,10 @@ const handlePrintSalaryReport = () => {
                   </thead>
                   <tbody>
                     {filteredEmployees.map((employee, index) => (
-                      <tr key={employee.name}>
+                      <tr key={employee.id || employee.name}>
                         <td>{index + 1}</td><td><strong>{employee.name}</strong></td>
                         <td>{employee.position}</td><td>{money(employee.salary)}</td>
-                        <td><span className="status-active">Aktif</span></td>
+                        <td><span className="status-active">{employee.status === "nonaktif" ? "Nonaktif" : "Aktif"}</span></td>
                         <td>
   <div className="action-buttons employee-actions">
 <button
@@ -1609,7 +1761,7 @@ const handlePrintSalaryReport = () => {
 
         <tbody>
           {payrollData.map((employee, index) => (
-            <tr key={employee.name}>
+            <tr key={employee.id || employee.name}>
               <td>{index + 1}</td>
 
               <td>
@@ -1820,7 +1972,7 @@ const handlePrintSalaryReport = () => {
           employee.totalOvertimeRemainderMinutes;
 
         return (
-          <tr key={employee.name}>
+          <tr key={employee.id || employee.name}>
             <td>{index + 1}</td>
             <td><strong>{employee.name}</strong></td>
             <td>{employee.totalOvertimeHours} jam</td>
@@ -2300,7 +2452,7 @@ const handlePrintSalaryReport = () => {
               .reduce((sum, record) => sum + Number(record.amount || 0), 0);
             const bonusReservation = employeeBonusRecords.filter((record) => record.type === "reservation")
               .reduce((sum, record) => sum + Number(record.amount || 0), 0);
-            return <tr key={employee.name}>
+            return <tr key={employee.id || employee.name}>
               <td>{index + 1}</td><td><strong>{employee.name}</strong></td>
               <td>{employee.position}</td><td>{money(employee.salary)}</td>
               <td>{money(employee.overtimePay)}</td><td>{money(Number(employee.bonDeduction || 0))}</td>
